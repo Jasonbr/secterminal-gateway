@@ -1,0 +1,19 @@
+# Binaries
+secterminal-gateway
+secterminal-gateway-linux
+*.exe
+
+# Environment
+.env
+.env.local
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+secterminal-gateway-linux-amd64

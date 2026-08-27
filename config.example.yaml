@@ -1,0 +1,11 @@
+# secterminal AI Gateway Configuration
+# Copy to config.yaml and edit, or set environment variables.
+
+port: "8080"
+
+upstreamAPIs:
+  openaiKey: ""           # OpenAI API key for paid upstream
+  anthropicKey: ""       # Anthropic API key for paid upstream
+  zenBaseURL: "https://opencode.ai/zen/v1"  # OpenCode Zen base URL (free upstream)
+
+redisURL: ""              # Redis URL for rate-limit storage (Phase 2). Empty = in-memory.
