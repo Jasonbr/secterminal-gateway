@@ -11,11 +11,12 @@ type Config struct {
 	RedisURL      string            `yaml:"redisURL"`
 }
 
-// UpstreamAPIConfig stores API keys for each upstream provider.
+// UpstreamAPIConfig stores API keys and endpoints for each upstream provider.
 type UpstreamAPIConfig struct {
-	OpenAIKey    string `yaml:"openaiKey"`
-	AnthropicKey string `yaml:"anthropicKey"`
-	ZenBaseURL   string `yaml:"zenBaseURL"`
+	OpenAIKey     string `yaml:"openaiKey"`
+	AnthropicKey  string `yaml:"anthropicKey"`
+	ZenBaseURL    string `yaml:"zenBaseURL"`
+	ZenAuthToken  string `yaml:"zenAuthToken"`
 }
 
 // loadConfig reads configuration from environment variables with sensible defaults.
@@ -26,6 +27,7 @@ func loadConfig() *Config {
 			OpenAIKey:     getEnv("OPENAI_API_KEY", ""),
 			AnthropicKey:  getEnv("ANTHROPIC_API_KEY", ""),
 			ZenBaseURL:    getEnv("ZEN_BASE_URL", "https://opencode.ai/zen/v1"),
+			ZenAuthToken:  getEnv("ZEN_AUTH_TOKEN", "public"),
 		},
 		RedisURL: getEnv("REDIS_URL", ""),
 	}

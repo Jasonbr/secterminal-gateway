@@ -103,12 +103,12 @@ func anthropicToOpenAI(body []byte) (map[string]interface{}, error) {
 	return result, nil
 }
 
-// streamProxy sends a request to upstream and streams the SSE response back to the client.
+// streamProxy sends a request to upstream and streams the SSE response back.
+// Uses sharedHTTPClient — do NOT replace with a per-request client (leaks goroutines).
 func streamProxy(w http.ResponseWriter, req *http.Request, model GatewayModel) {
-	client := &http.Client{}
-	resp, err := client.Do(req)
+	resp, err := sharedHTTPClient.Do(req)
 	if err != nil {
-		log.Printf("upstream request failed: %v", err)
+		log.Printf("upstream request failed: model=%s err=%v", model.ID, err)
 		writeError(w, http.StatusBadGateway, "upstream request failed: "+err.Error())
 		return
 	}

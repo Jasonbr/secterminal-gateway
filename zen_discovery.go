@@ -25,31 +25,38 @@ type ZenModelsResponse struct {
 
 // ZenDiscovery periodically fetches available models from Zen upstream.
 type ZenDiscovery struct {
-	baseURL        string
+	baseURL         string
+	authToken       string
 	refreshInterval time.Duration
-	mu             sync.RWMutex
-	models         map[string]GatewayModel // id -> model
-	stopCh         chan struct{}
-	freeModels     map[string]bool // cache of known-free model IDs
+	mu              sync.RWMutex
+	models          map[string]GatewayModel // id -> model
+	stopCh          chan struct{}
+	freeModels      map[string]bool // cache of known-free model IDs (by upstream ID)
+	ready           bool            // true after the first successful fetch
+	httpClient      *http.Client
 }
 
 // NewZenDiscovery creates a new Zen model discovery instance.
-func NewZenDiscovery(baseURL string, refreshInterval time.Duration) *ZenDiscovery {
+func NewZenDiscovery(baseURL, authToken string, refreshInterval time.Duration) *ZenDiscovery {
 	return &ZenDiscovery{
-		baseURL:        baseURL,
+		baseURL:         baseURL,
+		authToken:       authToken,
 		refreshInterval: refreshInterval,
-		models:         make(map[string]GatewayModel),
-		freeModels:     make(map[string]bool),
-		stopCh:         make(chan struct{}),
+		models:          make(map[string]GatewayModel),
+		freeModels:      make(map[string]bool),
+		stopCh:          make(chan struct{}),
+		httpClient:      &http.Client{Timeout: 30 * time.Second},
 	}
 }
 
-// Start begins periodic model discovery.
+// Start begins periodic model discovery in a background goroutine.
+// The first fetch runs asynchronously so the gateway starts serving immediately
+// with just the static models. Zen models appear once the fetch completes.
 func (d *ZenDiscovery) Start() {
-	// Initial fetch
-	d.fetchModels()
-
 	go func() {
+		// Initial fetch — runs in background, doesn't block gateway startup.
+		d.fetchModels()
+
 		ticker := time.NewTicker(d.refreshInterval)
 		defer ticker.Stop()
 
@@ -97,6 +104,13 @@ func (d *ZenDiscovery) GetModel(id string) (GatewayModel, bool) {
 	return m, ok
 }
 
+// IsReady returns true after the first successful model fetch completes.
+func (d *ZenDiscovery) IsReady() bool {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return d.ready
+}
+
 func (d *ZenDiscovery) fetchModels() {
 	url := d.baseURL + "/models"
 	req, err := http.NewRequest(http.MethodGet, url, nil)
@@ -104,10 +118,9 @@ func (d *ZenDiscovery) fetchModels() {
 		log.Printf("zen discovery: failed to create request: %v", err)
 		return
 	}
-	req.Header.Set("Authorization", "Bearer public")
+	req.Header.Set("Authorization", "Bearer "+d.authToken)
 
-	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := d.httpClient.Do(req)
 	if err != nil {
 		log.Printf("zen discovery: failed to fetch models: %v", err)
 		return
@@ -136,7 +149,8 @@ func (d *ZenDiscovery) fetchModels() {
 	}
 	d.mu.RUnlock()
 
-	sem := make(chan struct{}, 5)
+	// Concurrency limited to 3 to reduce load on Zen's API.
+	sem := make(chan struct{}, 3)
 	for _, m := range modelsResp.Data {
 		wg.Add(1)
 		go func(model ZenModel) {
@@ -179,6 +193,7 @@ func (d *ZenDiscovery) fetchModels() {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
+	// Preserve any non-Zen models (shouldn't exist, but defensive).
 	for id, m := range d.models {
 		if m.UpstreamType != "zen" || id == "sect-free-zen" {
 			if _, exists := newModels[id]; !exists {
@@ -189,11 +204,14 @@ func (d *ZenDiscovery) fetchModels() {
 
 	d.models = newModels
 	d.freeModels = newFreeModels
+	d.ready = true
 	log.Printf("zen discovery: found %d free models (out of %d total)", len(newModels), len(modelsResp.Data))
 }
 
 // probeModel checks if a model supports free access (Bearer public).
-// Returns true if the model is free (200, 429, 400), false if it requires paid API key (401).
+// Returns true if the model is free (200, 429, 400), false if it requires
+// a paid API key (401). Uses a short 5-second timeout to avoid blocking
+// the discovery loop.
 func (d *ZenDiscovery) probeModel(modelID string) bool {
 	url := d.baseURL + "/chat/completions"
 	body := `{"model":"` + modelID + `","messages":[{"role":"user","content":"hi"}],"max_tokens":1}`
@@ -203,10 +221,11 @@ func (d *ZenDiscovery) probeModel(modelID string) bool {
 		return false
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer public")
+	req.Header.Set("Authorization", "Bearer "+d.authToken)
 
-	client := &http.Client{Timeout: 15 * time.Second}
-	resp, err := client.Do(req)
+	// Short timeout: we only care about the status code, not the full response.
+	probeClient := &http.Client{Timeout: 5 * time.Second}
+	resp, err := probeClient.Do(req)
 	if err != nil {
 		return false
 	}
