@@ -29,10 +29,9 @@ type ZenDiscovery struct {
 	authToken       string
 	refreshInterval time.Duration
 	mu              sync.RWMutex
-	models          map[string]GatewayModel // id -> model
+	models          map[string]GatewayModel // id -> model (only free models)
 	stopCh          chan struct{}
-	freeModels      map[string]bool // cache of known-free model IDs (by upstream ID)
-	ready           bool            // true after the first successful fetch
+	ready           bool // true after the first successful fetch
 	httpClient      *http.Client
 }
 
@@ -43,7 +42,6 @@ func NewZenDiscovery(baseURL, authToken string, refreshInterval time.Duration) *
 		authToken:       authToken,
 		refreshInterval: refreshInterval,
 		models:          make(map[string]GatewayModel),
-		freeModels:      make(map[string]bool),
 		stopCh:          make(chan struct{}),
 		httpClient:      &http.Client{Timeout: 30 * time.Second},
 	}
@@ -138,16 +136,12 @@ func (d *ZenDiscovery) fetchModels() {
 		return
 	}
 
+	// Probe ALL models every cycle — no caching of free/paid status.
+	// Zen models can change from paid to free and vice versa at any time,
+	// so we must re-probe every model on every refresh to catch changes.
 	var wg sync.WaitGroup
 	var mu sync.Mutex
-	newFreeModels := make(map[string]bool)
 	newModels := make(map[string]GatewayModel)
-
-	d.mu.RLock()
-	for id := range d.freeModels {
-		newFreeModels[id] = true
-	}
-	d.mu.RUnlock()
 
 	// Concurrency limited to 3 to reduce load on Zen's API.
 	sem := make(chan struct{}, 3)
@@ -158,24 +152,11 @@ func (d *ZenDiscovery) fetchModels() {
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
-			gatewayID := "zen-" + model.ID
-
-			mu.Lock()
-			_, knownFree := newFreeModels[model.ID]
-			mu.Unlock()
-
-			if !knownFree {
-				if d.probeModel(model.ID) {
-					mu.Lock()
-					newFreeModels[model.ID] = true
-					mu.Unlock()
-					log.Printf("zen discovery: model %q is FREE", model.ID)
-				} else {
-					log.Printf("zen discovery: model %q requires paid API key, skipping", model.ID)
-					return
-				}
+			if !d.probeModel(model.ID) {
+				return
 			}
 
+			gatewayID := "zen-" + model.ID
 			mu.Lock()
 			newModels[gatewayID] = GatewayModel{
 				ID:           gatewayID,
@@ -203,7 +184,6 @@ func (d *ZenDiscovery) fetchModels() {
 	}
 
 	d.models = newModels
-	d.freeModels = newFreeModels
 	d.ready = true
 	log.Printf("zen discovery: found %d free models (out of %d total)", len(newModels), len(modelsResp.Data))
 }
@@ -223,8 +203,7 @@ func (d *ZenDiscovery) probeModel(modelID string) bool {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+d.authToken)
 
-	// Short timeout: we only care about the status code, not the full response.
-	probeClient := &http.Client{Timeout: 5 * time.Second}
+	probeClient := &http.Client{Timeout: 10 * time.Second}
 	resp, err := probeClient.Do(req)
 	if err != nil {
 		return false
@@ -234,9 +213,7 @@ func (d *ZenDiscovery) probeModel(modelID string) bool {
 	switch resp.StatusCode {
 	case http.StatusOK, http.StatusTooManyRequests, http.StatusBadRequest:
 		return true
-	case http.StatusUnauthorized:
-		return false
 	default:
-		return resp.StatusCode >= 200 && resp.StatusCode < 500
+		return false
 	}
 }
