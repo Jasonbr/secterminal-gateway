@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 )
@@ -29,6 +30,7 @@ type ZenDiscovery struct {
 	mu             sync.RWMutex
 	models         map[string]GatewayModel // id -> model
 	stopCh         chan struct{}
+	freeModels     map[string]bool // cache of known-free model IDs
 }
 
 // NewZenDiscovery creates a new Zen model discovery instance.
@@ -37,6 +39,7 @@ func NewZenDiscovery(baseURL string, refreshInterval time.Duration) *ZenDiscover
 		baseURL:        baseURL,
 		refreshInterval: refreshInterval,
 		models:         make(map[string]GatewayModel),
+		freeModels:     make(map[string]bool),
 		stopCh:         make(chan struct{}),
 	}
 }
@@ -122,29 +125,99 @@ func (d *ZenDiscovery) fetchModels() {
 		return
 	}
 
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	newFreeModels := make(map[string]bool)
+	newModels := make(map[string]GatewayModel)
+
+	d.mu.RLock()
+	for id := range d.freeModels {
+		newFreeModels[id] = true
+	}
+	d.mu.RUnlock()
+
+	sem := make(chan struct{}, 5)
+	for _, m := range modelsResp.Data {
+		wg.Add(1)
+		go func(model ZenModel) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			gatewayID := "zen-" + model.ID
+
+			mu.Lock()
+			_, knownFree := newFreeModels[model.ID]
+			mu.Unlock()
+
+			if !knownFree {
+				if d.probeModel(model.ID) {
+					mu.Lock()
+					newFreeModels[model.ID] = true
+					mu.Unlock()
+					log.Printf("zen discovery: model %q is FREE", model.ID)
+				} else {
+					log.Printf("zen discovery: model %q requires paid API key, skipping", model.ID)
+					return
+				}
+			}
+
+			mu.Lock()
+			newModels[gatewayID] = GatewayModel{
+				ID:           gatewayID,
+				DisplayName:  "Zen " + model.ID,
+				AllowFree:    true,
+				Upstream:     model.ID,
+				UpstreamType: "zen",
+				RateLimit:    RateLimit{DailyRequests: 20, PromoTokens: 20000, HourlyTokens: 3000},
+			}
+			mu.Unlock()
+		}(m)
+	}
+	wg.Wait()
+
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	// Update models map - all Zen models are free
-	newModels := make(map[string]GatewayModel)
-	for _, m := range modelsResp.Data {
-		newModels[m.ID] = GatewayModel{
-			ID:           "zen-" + m.ID, // Prefix with "zen-" to avoid conflicts
-			DisplayName:  "Zen " + m.ID,
-			AllowFree:    true,
-			Upstream:     m.ID, // Original ID for upstream
-			UpstreamType: "zen",
-			RateLimit:    RateLimit{DailyRequests: 20, PromoTokens: 20000, HourlyTokens: 3000},
-		}
-	}
-
-	// Preserve any manually configured models (like sect-free-zen)
 	for id, m := range d.models {
 		if m.UpstreamType != "zen" || id == "sect-free-zen" {
-			newModels[id] = m
+			if _, exists := newModels[id]; !exists {
+				newModels[id] = m
+			}
 		}
 	}
 
 	d.models = newModels
-	log.Printf("zen discovery: found %d models", len(modelsResp.Data))
+	d.freeModels = newFreeModels
+	log.Printf("zen discovery: found %d free models (out of %d total)", len(newModels), len(modelsResp.Data))
+}
+
+// probeModel checks if a model supports free access (Bearer public).
+// Returns true if the model is free (200, 429, 400), false if it requires paid API key (401).
+func (d *ZenDiscovery) probeModel(modelID string) bool {
+	url := d.baseURL + "/chat/completions"
+	body := `{"model":"` + modelID + `","messages":[{"role":"user","content":"hi"}],"max_tokens":1}`
+
+	req, err := http.NewRequest(http.MethodPost, url, strings.NewReader(body))
+	if err != nil {
+		return false
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer public")
+
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+
+	switch resp.StatusCode {
+	case http.StatusOK, http.StatusTooManyRequests, http.StatusBadRequest:
+		return true
+	case http.StatusUnauthorized:
+		return false
+	default:
+		return resp.StatusCode >= 200 && resp.StatusCode < 500
+	}
 }
