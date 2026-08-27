@@ -136,40 +136,27 @@ func (d *ZenDiscovery) fetchModels() {
 		return
 	}
 
-	// Probe ALL models every cycle — no caching of free/paid status.
-	// Zen models can change from paid to free and vice versa at any time,
-	// so we must re-probe every model on every refresh to catch changes.
-	var wg sync.WaitGroup
-	var mu sync.Mutex
+	// Filter free models by the "-free" suffix convention.
+	// Zen's /models endpoint does not include a pricing field, but free
+	// models are named with a "-free" suffix (e.g. "hy3-free"). This
+	// matches the OpenCode client's convention for displaying free models.
 	newModels := make(map[string]GatewayModel)
-
-	// Concurrency limited to 3 to reduce load on Zen's API.
-	sem := make(chan struct{}, 3)
+	freeCount := 0
 	for _, m := range modelsResp.Data {
-		wg.Add(1)
-		go func(model ZenModel) {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-
-			if !d.probeModel(model.ID) {
-				return
-			}
-
-			gatewayID := "zen-" + model.ID
-			mu.Lock()
-			newModels[gatewayID] = GatewayModel{
-				ID:           gatewayID,
-				DisplayName:  "Zen " + model.ID,
-				AllowFree:    true,
-				Upstream:     model.ID,
-				UpstreamType: "zen",
-				RateLimit:    RateLimit{DailyRequests: 20, PromoTokens: 20000, HourlyTokens: 3000},
-			}
-			mu.Unlock()
-		}(m)
+		if !strings.HasSuffix(m.ID, "-free") {
+			continue
+		}
+		gatewayID := "zen-" + m.ID
+		newModels[gatewayID] = GatewayModel{
+			ID:           gatewayID,
+			DisplayName:  "Zen " + m.ID,
+			AllowFree:    true,
+			Upstream:     m.ID,
+			UpstreamType: "zen",
+			RateLimit:    RateLimit{DailyRequests: 20, PromoTokens: 20000, HourlyTokens: 3000},
+		}
+		freeCount++
 	}
-	wg.Wait()
 
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -185,35 +172,5 @@ func (d *ZenDiscovery) fetchModels() {
 
 	d.models = newModels
 	d.ready = true
-	log.Printf("zen discovery: found %d free models (out of %d total)", len(newModels), len(modelsResp.Data))
-}
-
-// probeModel checks if a model supports free access (Bearer public).
-// Returns true if the model is free (200, 429, 400), false if it requires
-// a paid API key (401). Uses a short 5-second timeout to avoid blocking
-// the discovery loop.
-func (d *ZenDiscovery) probeModel(modelID string) bool {
-	url := d.baseURL + "/chat/completions"
-	body := `{"model":"` + modelID + `","messages":[{"role":"user","content":"hi"}],"max_tokens":1}`
-
-	req, err := http.NewRequest(http.MethodPost, url, strings.NewReader(body))
-	if err != nil {
-		return false
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+d.authToken)
-
-	probeClient := &http.Client{Timeout: 10 * time.Second}
-	resp, err := probeClient.Do(req)
-	if err != nil {
-		return false
-	}
-	defer resp.Body.Close()
-
-	switch resp.StatusCode {
-	case http.StatusOK, http.StatusTooManyRequests, http.StatusBadRequest:
-		return true
-	default:
-		return false
-	}
+	log.Printf("zen discovery: found %d free models (out of %d total)", freeCount, len(modelsResp.Data))
 }
